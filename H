@@ -1,102 +1,29 @@
-public async Task<List<User>> GetUsersAsync(List<string> ids)
+public class RequestCache
 {
-    var result = new List<User>();
+    private readonly IHttpContextAccessor _httpContextAccessor;
 
-    foreach (var chunk in ids.Chunk(20))
+    public RequestCache(IHttpContextAccessor accessor) 
+        => _httpContextAccessor = accessor;
+
+    private IDictionary<object, object?> Items =>
+        _httpContextAccessor.HttpContext!.Items;
+
+    public T? Get<T>(string key) =>
+        Items.TryGetValue(key, out var value) ? (T?)value : default;
+
+    public void Set<T>(string key, T value) =>
+        Items[key] = value;
+
+    public async Task<T> GetOrSetAsync<T>(string key, Func<Task<T>> factory)
     {
-        var fetched = await FetchChunkAsync(chunk.ToList());
-        result.AddRange(fetched);
-    }
+        if (Items.TryGetValue(key, out var existing))
+            return (T)existing!;
 
-    return result;
+        var value = await factory();
+        Items[key] = value;
+        return value;
+    }
 }
 
-private async Task<List<User>> FetchChunkAsync(List<string> ids)
-{
-    var result = new List<User>();
-    var fallbackIds = new List<string>();
-
-    // Batch 1: UPN direct lookup
-    var upnBatch = new BatchRequestContent();
-    var upnStepMap = new Dictionary<string, string>();
-
-    foreach (var id in ids)
-    {
-        var stepId = upnBatch.AddBatchRequestStep(
-            graphClient.Users[id]
-                .Request()
-                .Select(u => new { u.Id, u.DisplayName, u.Mail, u.UserPrincipalName })
-                .GetHttpRequestMessage());
-
-        upnStepMap[stepId] = id;
-    }
-
-    var upnResponse = await graphClient.Batch.Request().PostAsync(upnBatch);
-
-    foreach (var (stepId, id) in upnStepMap)
-    {
-        try
-        {
-            result.Add(await upnResponse.GetResponseByIdAsync<User>(stepId));
-        }
-        catch (ServiceException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-        {
-            fallbackIds.Add(id);
-        }
-    }
-
-    if (!fallbackIds.Any()) return result;
-
-    // Batch 2: Mail filter fallback
-    var mailBatch = new BatchRequestContent();
-    var mailStepMap = new Dictionary<string, string>();
-
-    foreach (var id in fallbackIds)
-    {
-        var stepId = mailBatch.AddBatchRequestStep(
-            graphClient.Users
-                .Request()
-                .Header("ConsistencyLevel", "eventual")
-                .Filter($"mail eq '{id}'")
-                .Top(1)
-                .Select(u => new { u.Id, u.DisplayName, u.Mail, u.UserPrincipalName })
-                .GetHttpRequestMessage());
-
-        mailStepMap[stepId] = id;
-    }
-
-    var mailResponse = await graphClient.Batch.Request().PostAsync(mailBatch);
-
-    foreach (var (stepId, id) in mailStepMap)
-    {
-        try
-        {
-            var response = await mailResponse.GetResponseByIdAsync<UserCollectionResponse>(stepId);
-            var user = response?.Value?.FirstOrDefault();
-            if (user != null) result.Add(user);
-        }
-        catch (ServiceException ex)
-        {
-            _logger.LogWarning("User not found for {Id}: {Message}", id, ex.Message);
-        }
-    }
-
-    return result;
-}
-```
-
----
-
-### Flow
-```
-Input: List<string>
-    │
-    └── Chunk into 20s (Graph batch limit)
-            │
-            ├── Batch 1: UPN direct lookup — all IDs in one HTTP request
-            │       ├── ✅ Found → add to result
-            │       └── ❌ 404  → move to fallback
-            │
-            └── Batch 2: Mail filter — only failed IDs (eventual consistency)
-                    ├── ✅ Found → add to result
-                    └── ❌ Not found → log + skip
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<RequestCache>();
