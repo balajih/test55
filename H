@@ -1,29 +1,45 @@
-public class RequestCache
+// IRequestCache.cs
+public interface IRequestCache
 {
-    private readonly IHttpContextAccessor _httpContextAccessor;
-
-    public RequestCache(IHttpContextAccessor accessor) 
-        => _httpContextAccessor = accessor;
-
-    private IDictionary<object, object?> Items =>
-        _httpContextAccessor.HttpContext!.Items;
-
-    public T? Get<T>(string key) =>
-        Items.TryGetValue(key, out var value) ? (T?)value : default;
-
-    public void Set<T>(string key, T value) =>
-        Items[key] = value;
-
-    public async Task<T> GetOrSetAsync<T>(string key, Func<Task<T>> factory)
-    {
-        if (Items.TryGetValue(key, out var existing))
-            return (T)existing!;
-
-        var value = await factory();
-        Items[key] = value;
-        return value;
-    }
+    T GetOrSet<T>(string key, Func<T> factory);
+    void Set<T>(string key, T value);
+    bool TryGet<T>(string key, out T? value);
+    void Remove(string key);
 }
 
-builder.Services.AddHttpContextAccessor();
-builder.Services.AddScoped<RequestCache>();
+// RequestCache.cs
+public sealed class RequestCache : IRequestCache
+{
+    private readonly ConcurrentDictionary<string, Lazy<object?>> _cache = new();
+
+    public T GetOrSet<T>(string key, Func<T> factory)
+    {
+        // Lazy<T> ensures the factory runs exactly once per key,
+        // even if multiple threads call GetOrSet simultaneously.
+        var lazy = _cache.GetOrAdd(key, _ => new Lazy<object?>(() => factory(), LazyThreadSafetyMode.ExecutionAndPublication));
+
+        return (T)lazy.Value!;
+    }
+
+    public void Set<T>(string key, T value)
+    {
+        _cache[key] = new Lazy<object?>(value);
+    }
+
+    public bool TryGet<T>(string key, out T? value)
+    {
+        if (_cache.TryGetValue(key, out var lazy))
+        {
+            value = (T)lazy.Value!;
+            return true;
+        }
+
+        value = default;
+        return false;
+    }
+
+    public void Remove(string key)
+    {
+        _cache.TryRemove(key, out _);
+    }
+}
