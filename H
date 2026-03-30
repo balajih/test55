@@ -1,43 +1,91 @@
-// IRequestCache.cs
+/// <summary>
+/// Thread-safe, per-request cache. Register as Scoped so each HTTP request
+/// gets its own instance that is disposed when the request ends.
+/// </summary>
 public interface IRequestCache
 {
-    T GetOrSet<T>(string key, Func<T> factory);
+    /// <summary>
+    /// Gets or creates a cached value for the given key.
+    /// The factory is guaranteed to run at most once per key, even under concurrent access.
+    /// </summary>
+    T GetOrAdd<T>(string key, Func<T> factory);
+
+    /// <summary>
+    /// Adds or overwrites a cached value for the given key.
+    /// </summary>
     void Set<T>(string key, T value);
+
+    /// <summary>
+    /// Tries to retrieve a cached value.
+    /// Returns <see langword="false"/> if the key is not found or the stored type doesn't match.
+    /// </summary>
     bool TryGet<T>(string key, out T? value);
+
+    /// <summary>
+    /// Removes the entry for the given key. No-op if the key doesn't exist.
+    /// </summary>
     void Remove(string key);
 }
 
-// RequestCache.cs
-public sealed class RequestCache : IRequestCache
+
+
+
+
+
+
+
+
+
+
+using System.Collections.Concurrent;
+
+/// <summary>
+/// <see cref="ConcurrentDictionary{TKey,TValue}"/>-backed implementation of
+/// <see cref="IRequestCache"/>. Uses <see cref="Lazy{T}"/> in <see cref="GetOrAdd{T}"/>
+/// to guarantee exactly-once factory execution under contention.
+/// </summary>
+public class RequestCache : IRequestCache
 {
-    private readonly ConcurrentDictionary<string, Lazy<object?>> _cache = new();
+    private readonly ConcurrentDictionary<string, object?> _cache = new();
 
-    public T GetOrSet<T>(string key, Func<T> factory)
+    /// <inheritdoc />
+    public T GetOrAdd<T>(string key, Func<T> factory)
     {
-        // Lazy<T> ensures the factory runs exactly once per key,
-        // even if multiple threads call GetOrSet simultaneously.
-        var lazy = _cache.GetOrAdd(key, _ => new Lazy<object?>(() => factory(), LazyThreadSafetyMode.ExecutionAndPublication));
-
-        return (T)lazy.Value!;
+        var lazy = (Lazy<T>)_cache.GetOrAdd(key, _ => new Lazy<T>(factory));
+        return lazy.Value;
     }
 
+    /// <inheritdoc />
     public void Set<T>(string key, T value)
     {
-        _cache[key] = new Lazy<object?>(value);
+        _cache[key] = value;
     }
 
+    /// <inheritdoc />
     public bool TryGet<T>(string key, out T? value)
     {
-        if (_cache.TryGetValue(key, out var lazy))
+        if (_cache.TryGetValue(key, out var obj))
         {
-            value = (T)lazy.Value!;
-            return true;
+            // Unwrap Lazy<T> if stored via GetOrAdd
+            if (obj is Lazy<T> lazy)
+            {
+                value = lazy.Value;
+                return true;
+            }
+
+            // Direct value stored via Set
+            if (obj is T typed)
+            {
+                value = typed;
+                return true;
+            }
         }
 
         value = default;
         return false;
     }
 
+    /// <inheritdoc />
     public void Remove(string key)
     {
         _cache.TryRemove(key, out _);
