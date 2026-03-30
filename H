@@ -1,30 +1,121 @@
+using System.Collections.Concurrent;
+
+namespace YourProject.Caching;
+
 /// <summary>
-/// Thread-safe, per-request cache. Register as Scoped so each HTTP request
-/// gets its own instance that is disposed when the request ends.
+/// Thread-safe cache scoped to a single HTTP request.
+/// Registered as Scoped, so it is created per request and disposed automatically.
 /// </summary>
-public interface IRequestCache
+public sealed class RequestCache : IRequestCache, IDisposable
 {
-    /// <summary>
-    /// Gets or creates a cached value for the given key.
-    /// The factory is guaranteed to run at most once per key, even under concurrent access.
-    /// </summary>
-    T GetOrAdd<T>(string key, Func<T> factory);
+    private readonly ConcurrentDictionary<string, Lazy<object?>> _cache = new();
+    private volatile bool _disposed;
+
+    /// <inheritdoc />
+    public T? Get<T>(string key)
+    {
+        ThrowIfDisposed();
+
+        if (_cache.TryGetValue(key, out var lazy))
+        {
+            return (T?)lazy.Value;
+        }
+
+        return default;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The factory runs at most once per key, even if multiple threads call this simultaneously.
+    /// </remarks>
+    public T GetOrAdd<T>(string key, Func<T> factory)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(factory);
+
+        var lazy = _cache.GetOrAdd(key, _ => new Lazy<object?>(
+            () => factory(),
+            LazyThreadSafetyMode.ExecutionAndPublication));
+
+        return (T)lazy.Value!;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Uses a Lazy wrapper so only one thread executes the async factory per key.
+    /// The Task itself is cached, so subsequent callers await the same result.
+    /// </remarks>
+    public async Task<T> GetOrAddAsync<T>(string key, Func<Task<T>> factory)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(factory);
+
+        var lazy = _cache.GetOrAdd(key, _ => new Lazy<object?>(
+            () => factory(),
+            LazyThreadSafetyMode.ExecutionAndPublication));
+
+        // The stored value is a Task<T>; await it.
+        return await ((Task<T>)lazy.Value!).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public void Set<T>(string key, T value)
+    {
+        ThrowIfDisposed();
+
+        // Wrap in an already-evaluated Lazy so the value is immediately available.
+        var lazy = new Lazy<object?>(value);
+        _cache[key] = lazy;
+    }
+
+    /// <inheritdoc />
+    public bool Remove(string key)
+    {
+        ThrowIfDisposed();
+        return _cache.TryRemove(key, out _);
+    }
+
+    /// <inheritdoc />
+    public bool ContainsKey(string key)
+    {
+        ThrowIfDisposed();
+        return _cache.ContainsKey(key);
+    }
+
+    /// <inheritdoc />
+    public void Clear()
+    {
+        ThrowIfDisposed();
+        _cache.Clear();
+    }
 
     /// <summary>
-    /// Adds or overwrites a cached value for the given key.
+    /// Called by the DI container at the end of the request scope.
+    /// Disposes any cached values that implement IDisposable.
     /// </summary>
-    void Set<T>(string key, T value);
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        foreach (var entry in _cache)
+        {
+            if (entry.Value.IsValueCreated && entry.Value.Value is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
+        }
+
+        _cache.Clear();
+    }
 
     /// <summary>
-    /// Tries to retrieve a cached value.
-    /// Returns <see langword="false"/> if the key is not found or the stored type doesn't match.
+    /// Guards every public method against use after disposal.
     /// </summary>
-    bool TryGet<T>(string key, out T? value);
-
-    /// <summary>
-    /// Removes the entry for the given key. No-op if the key doesn't exist.
-    /// </summary>
-    void Remove(string key);
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+    }
 }
 
 
@@ -37,57 +128,47 @@ public interface IRequestCache
 
 
 
-using System.Collections.Concurrent;
+
+
+namespace YourProject.Caching;
 
 /// <summary>
-/// <see cref="ConcurrentDictionary{TKey,TValue}"/>-backed implementation of
-/// <see cref="IRequestCache"/>. Uses <see cref="Lazy{T}"/> in <see cref="GetOrAdd{T}"/>
-/// to guarantee exactly-once factory execution under contention.
+/// A cache that lives only for the duration of a single HTTP request.
 /// </summary>
-public class RequestCache : IRequestCache
+public interface IRequestCache
 {
-    private readonly ConcurrentDictionary<string, object?> _cache = new();
+    /// <summary>
+    /// Gets a cached value by key, or returns the default if not found.
+    /// </summary>
+    T? Get<T>(string key);
 
-    /// <inheritdoc />
-    public T GetOrAdd<T>(string key, Func<T> factory)
-    {
-        var lazy = (Lazy<T>)_cache.GetOrAdd(key, _ => new Lazy<T>(factory));
-        return lazy.Value;
-    }
+    /// <summary>
+    /// Gets a cached value by key, or creates and caches it using the factory.
+    /// </summary>
+    T GetOrAdd<T>(string key, Func<T> factory);
 
-    /// <inheritdoc />
-    public void Set<T>(string key, T value)
-    {
-        _cache[key] = value;
-    }
+    /// <summary>
+    /// Gets a cached value by key, or creates and caches it using an async factory.
+    /// </summary>
+    Task<T> GetOrAddAsync<T>(string key, Func<Task<T>> factory);
 
-    /// <inheritdoc />
-    public bool TryGet<T>(string key, out T? value)
-    {
-        if (_cache.TryGetValue(key, out var obj))
-        {
-            // Unwrap Lazy<T> if stored via GetOrAdd
-            if (obj is Lazy<T> lazy)
-            {
-                value = lazy.Value;
-                return true;
-            }
+    /// <summary>
+    /// Adds or overwrites a value in the cache.
+    /// </summary>
+    void Set<T>(string key, T value);
 
-            // Direct value stored via Set
-            if (obj is T typed)
-            {
-                value = typed;
-                return true;
-            }
-        }
+    /// <summary>
+    /// Removes a specific key from the cache.
+    /// </summary>
+    bool Remove(string key);
 
-        value = default;
-        return false;
-    }
+    /// <summary>
+    /// Returns true if the key exists in the cache.
+    /// </summary>
+    bool ContainsKey(string key);
 
-    /// <inheritdoc />
-    public void Remove(string key)
-    {
-        _cache.TryRemove(key, out _);
-    }
+    /// <summary>
+    /// Removes all entries from the cache.
+    /// </summary>
+    void Clear();
 }
