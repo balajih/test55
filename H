@@ -1,174 +1,85 @@
-using System.Collections.Concurrent;
+// Arrange
+var ids = new List<string> { "id1", "id2" };
 
-namespace YourProject.Caching;
+// 1. Mock the individual user request (for GetHttpRequestMessage)
+var mockUserRequest = new Mock<IUserRequest>();
+mockUserRequest
+    .Setup(r => r.Select(It.IsAny<Expression<Func<User, object>>>()))
+    .Returns(mockUserRequest.Object);
+mockUserRequest
+    .Setup(r => r.GetHttpRequestMessage())
+    .Returns(new HttpRequestMessage(HttpMethod.Get, "https://graph.microsoft.com/v1.0/users/id1"));
 
-/// <summary>
-/// Thread-safe cache scoped to a single HTTP request.
-/// Registered as Scoped, so it is created per request and disposed automatically.
-/// </summary>
-public sealed class RequestCache : IRequestCache, IDisposable
+// 2. Mock Users[id] to return the request builder
+var mockUserRequestBuilder = new Mock<IUserRequestBuilder>();
+mockUserRequestBuilder
+    .Setup(b => b.Request())
+    .Returns(mockUserRequest.Object);
+
+// 3. Mock _graphClient.Users[id]
+var mockUsersCollectionRequestBuilder = new Mock<IUsersCollectionRequestBuilder>();
+mockUsersCollectionRequestBuilder
+    .Setup(u => u[It.IsAny<string>()])
+    .Returns(mockUserRequestBuilder.Object);
+
+// 4. Mock BatchRequestContent (upnBatch)
+var mockBatchRequestContent = new Mock<BatchRequestContent>();
+mockBatchRequestContent
+    .Setup(b => b.AddBatchRequestStep(It.IsAny<HttpRequestMessage>()))
+    .Returns("stepId1"); // return a fake stepId
+
+// 5. Mock the batch response
+var mockBatchResponseContent = new Mock<BatchResponseContent>();
+
+// Simulate per-step response
+var user = new User
 {
-    private readonly ConcurrentDictionary<string, Lazy<object?>> _cache = new();
-    private volatile bool _disposed;
+    GivenName = "Test",
+    Surname = "User",
+    DisplayName = "Test User",
+    Mail = "user@example.com"
+};
 
-    /// <inheritdoc />
-    public T? Get<T>(string key)
-    {
-        ThrowIfDisposed();
+mockBatchResponseContent
+    .Setup(r => r.GetResponseByIdAsync<User>(It.IsAny<string>()))
+    .ReturnsAsync(user);
 
-        if (_cache.TryGetValue(key, out var lazy))
-        {
-            return (T?)lazy.Value;
-        }
+// 6. Mock _graphClient.Batch.Request().PostAsync(...)
+var mockBatchRequest = new Mock<IBatchRequest>();
+mockBatchRequest
+    .Setup(r => r.PostAsync(
+        It.IsAny<BatchRequestContent>(),
+        It.IsAny<CancellationToken>()))
+    .ReturnsAsync(mockBatchResponseContent.Object);
 
-        return default;
-    }
+var mockBatchRequestBuilder = new Mock<IBatchRequestBuilder>();
+mockBatchRequestBuilder
+    .Setup(b => b.Request())
+    .Returns(mockBatchRequest.Object);
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// The factory runs at most once per key, even if multiple threads call this simultaneously.
-    /// </remarks>
-    public T GetOrAdd<T>(string key, Func<T> factory)
-    {
-        ThrowIfDisposed();
-        ArgumentNullException.ThrowIfNull(factory);
-
-        var lazy = _cache.GetOrAdd(key, _ => new Lazy<object?>(
-            () => factory(),
-            LazyThreadSafetyMode.ExecutionAndPublication));
-
-        return (T)lazy.Value!;
-    }
-
-    /// <inheritdoc />
-    /// <remarks>
-    /// Uses a Lazy wrapper so only one thread executes the async factory per key.
-    /// The Task itself is cached, so subsequent callers await the same result.
-    /// </remarks>
-    public async Task<T> GetOrAddAsync<T>(string key, Func<Task<T>> factory)
-    {
-        ThrowIfDisposed();
-        ArgumentNullException.ThrowIfNull(factory);
-
-        var lazy = _cache.GetOrAdd(key, _ => new Lazy<object?>(
-            () => factory(),
-            LazyThreadSafetyMode.ExecutionAndPublication));
-
-        // The stored value is a Task<T>; await it.
-        return await ((Task<T>)lazy.Value!).ConfigureAwait(false);
-    }
-
-    /// <inheritdoc />
-    public void Set<T>(string key, T value)
-    {
-        ThrowIfDisposed();
-
-        // Wrap in an already-evaluated Lazy so the value is immediately available.
-        var lazy = new Lazy<object?>(value);
-        _cache[key] = lazy;
-    }
-
-    /// <inheritdoc />
-    public bool Remove(string key)
-    {
-        ThrowIfDisposed();
-        return _cache.TryRemove(key, out _);
-    }
-
-    /// <inheritdoc />
-    public bool ContainsKey(string key)
-    {
-        ThrowIfDisposed();
-        return _cache.ContainsKey(key);
-    }
-
-    /// <inheritdoc />
-    public void Clear()
-    {
-        ThrowIfDisposed();
-        _cache.Clear();
-    }
-
-    /// <summary>
-    /// Called by the DI container at the end of the request scope.
-    /// Disposes any cached values that implement IDisposable.
-    /// </summary>
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-
-        foreach (var entry in _cache)
-        {
-            if (entry.Value.IsValueCreated && entry.Value.Value is IDisposable disposable)
-            {
-                disposable.Dispose();
-            }
-        }
-
-        _cache.Clear();
-    }
-
-    /// <summary>
-    /// Guards every public method against use after disposal.
-    /// </summary>
-    private void ThrowIfDisposed()
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-    }
-}
+// 7. Wire everything to the graph client
+var mockGraphClient = new Mock<IGraphServiceClient>();
+mockGraphClient.Setup(c => c.Users).Returns(mockUsersCollectionRequestBuilder.Object);
+mockGraphClient.Setup(c => c.Batch).Returns(mockBatchRequestBuilder.Object);
 
 
 
-
-
-
-
-
-
-
-
-
-
-namespace YourProject.Caching;
-
-/// <summary>
-/// A cache that lives only for the duration of a single HTTP request.
-/// </summary>
-public interface IRequestCache
+[Fact]
+public async Task GetUsers_Batch_ShouldReturnUsers()
 {
-    /// <summary>
-    /// Gets a cached value by key, or returns the default if not found.
-    /// </summary>
-    T? Get<T>(string key);
+    // Arrange (setup above)
+    var sut = new YourService(mockGraphClient.Object);
 
-    /// <summary>
-    /// Gets a cached value by key, or creates and caches it using the factory.
-    /// </summary>
-    T GetOrAdd<T>(string key, Func<T> factory);
+    // Act
+    var result = await sut.GetUsersByIds(ids);
 
-    /// <summary>
-    /// Gets a cached value by key, or creates and caches it using an async factory.
-    /// </summary>
-    Task<T> GetOrAddAsync<T>(string key, Func<Task<T>> factory);
+    // Assert
+    mockBatchRequest.Verify(
+        r => r.PostAsync(
+            It.IsAny<BatchRequestContent>(),
+            It.IsAny<CancellationToken>()),
+        Times.Once);
 
-    /// <summary>
-    /// Adds or overwrites a value in the cache.
-    /// </summary>
-    void Set<T>(string key, T value);
-
-    /// <summary>
-    /// Removes a specific key from the cache.
-    /// </summary>
-    bool Remove(string key);
-
-    /// <summary>
-    /// Returns true if the key exists in the cache.
-    /// </summary>
-    bool ContainsKey(string key);
-
-    /// <summary>
-    /// Removes all entries from the cache.
-    /// </summary>
-    void Clear();
+    Assert.NotNull(result);
+    Assert.Equal(ids.Count, result.Count);
 }
