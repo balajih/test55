@@ -1,85 +1,121 @@
-// Arrange
-var ids = new List<string> { "id1", "id2" };
+using Microsoft.Graph;
+using Microsoft.Kiota.Abstractions;
+using Moq;
+using Newtonsoft.Json;
+using System.Net;
+using System.Net.Http;
 
-// 1. Mock the individual user request (for GetHttpRequestMessage)
-var mockUserRequest = new Mock<IUserRequest>();
-mockUserRequest
-    .Setup(r => r.Select(It.IsAny<Expression<Func<User, object>>>()))
-    .Returns(mockUserRequest.Object);
-mockUserRequest
-    .Setup(r => r.GetHttpRequestMessage())
-    .Returns(new HttpRequestMessage(HttpMethod.Get, "https://graph.microsoft.com/v1.0/users/id1"));
-
-// 2. Mock Users[id] to return the request builder
-var mockUserRequestBuilder = new Mock<IUserRequestBuilder>();
-mockUserRequestBuilder
-    .Setup(b => b.Request())
-    .Returns(mockUserRequest.Object);
-
-// 3. Mock _graphClient.Users[id]
-var mockUsersCollectionRequestBuilder = new Mock<IUsersCollectionRequestBuilder>();
-mockUsersCollectionRequestBuilder
-    .Setup(u => u[It.IsAny<string>()])
-    .Returns(mockUserRequestBuilder.Object);
-
-// 4. Mock BatchRequestContent (upnBatch)
-var mockBatchRequestContent = new Mock<BatchRequestContent>();
-mockBatchRequestContent
-    .Setup(b => b.AddBatchRequestStep(It.IsAny<HttpRequestMessage>()))
-    .Returns("stepId1"); // return a fake stepId
-
-// 5. Mock the batch response
-var mockBatchResponseContent = new Mock<BatchResponseContent>();
-
-// Simulate per-step response
-var user = new User
+[TestClass]
+public class UserBatchRequestTests
 {
-    GivenName = "Test",
-    Surname = "User",
-    DisplayName = "Test User",
-    Mail = "user@example.com"
-};
+    private Mock<IHttpProvider> _mockHttpProvider;
+    private GraphServiceClient _graphClient;
 
-mockBatchResponseContent
-    .Setup(r => r.GetResponseByIdAsync<User>(It.IsAny<string>()))
-    .ReturnsAsync(user);
+    [TestInitialize]
+    public void Setup()
+    {
+        _mockHttpProvider = new Mock<IHttpProvider>();
+        
+        // Build a fake batch response with one user result per step
+        var batchResponse = new
+        {
+            responses = new[]
+            {
+                new
+                {
+                    id = "step_1",
+                    status = 200,
+                    body = new
+                    {
+                        value = new[]
+                        {
+                            new
+                            {
+                                givenName  = "John",
+                                surname    = "Doe",
+                                displayName = "John Doe",
+                                mail       = "john.doe@example.com",
+                                id         = "user-id-001"
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
-// 6. Mock _graphClient.Batch.Request().PostAsync(...)
-var mockBatchRequest = new Mock<IBatchRequest>();
-mockBatchRequest
-    .Setup(r => r.PostAsync(
-        It.IsAny<BatchRequestContent>(),
-        It.IsAny<CancellationToken>()))
-    .ReturnsAsync(mockBatchResponseContent.Object);
+        var responseJson    = JsonConvert.SerializeObject(batchResponse);
+        var httpResponse    = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(responseJson,
+                          System.Text.Encoding.UTF8,
+                          "application/json")
+        };
 
-var mockBatchRequestBuilder = new Mock<IBatchRequestBuilder>();
-mockBatchRequestBuilder
-    .Setup(b => b.Request())
-    .Returns(mockBatchRequest.Object);
+        // IHttpProvider.SendAsync returns the mocked HTTP response
+        _mockHttpProvider
+            .Setup(p => p.SendAsync(
+                It.IsAny<HttpRequestMessage>(),
+                It.IsAny<HttpCompletionOption>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(httpResponse);
 
-// 7. Wire everything to the graph client
-var mockGraphClient = new Mock<IGraphServiceClient>();
-mockGraphClient.Setup(c => c.Users).Returns(mockUsersCollectionRequestBuilder.Object);
-mockGraphClient.Setup(c => c.Batch).Returns(mockBatchRequestBuilder.Object);
+        // Wire the mock provider into GraphServiceClient
+        var mockAuthProvider = new Mock<IAuthenticationProvider>();
+        _graphClient = new GraphServiceClient(mockAuthProvider.Object,
+                                              _mockHttpProvider.Object);
+    }
 
+    [TestMethod]
+    public async Task FetchUsersByMail_ReturnsMappedUsers()
+    {
+        // Arrange
+        var fallbackIds = new List<string> { "john.doe@example.com" };
+        var mailBatch   = new BatchRequestContent();
+        var mailStepMap = new Dictionary<string, string>();
 
+        foreach (var id in fallbackIds)
+        {
+            var stepId = mailBatch.AddBatchRequestStep(
+                _graphClient.Users
+                    .Request()
+                    .Filter($"mail eq '{id}'")
+                    .Top(1)
+                    .Select(x => new { x.GivenName, x.Surname,
+                                       x.DisplayName, x.Mail, x.Id })
+                    .GetHttpRequestMessage());
 
-[Fact]
-public async Task GetUsers_Batch_ShouldReturnUsers()
-{
-    // Arrange (setup above)
-    var sut = new YourService(mockGraphClient.Object);
+            mailStepMap[stepId] = id;
+        }
 
-    // Act
-    var result = await sut.GetUsersByIds(ids);
+        // Act
+        var batchResponse = await _graphClient
+                                    .Batch
+                                    .Request()
+                                    .PostAsync(mailBatch);
 
-    // Assert
-    mockBatchRequest.Verify(
-        r => r.PostAsync(
-            It.IsAny<BatchRequestContent>(),
-            It.IsAny<CancellationToken>()),
-        Times.Once);
+        // Assert — each step resolves to the expected user
+        foreach (var (stepId, mail) in mailStepMap)
+        {
+            var usersPage = await batchResponse
+                                    .GetResponseByIdAsync<GraphServiceUsersCollectionResponse>(stepId);
 
-    Assert.NotNull(result);
-    Assert.Equal(ids.Count, result.Count);
+            Assert.IsNotNull(usersPage?.Value,
+                $"No user returned for mail '{mail}'");
+
+            var user = usersPage.Value.First();
+            Assert.AreEqual("john.doe@example.com", user.Mail);
+            Assert.AreEqual("John",  user.GivenName);
+            Assert.AreEqual("Doe",   user.Surname);
+            Assert.AreEqual("John Doe", user.DisplayName);
+            Assert.AreEqual("user-id-001", user.Id);
+        }
+
+        // Verify the HTTP provider was actually called once (the batch POST)
+        _mockHttpProvider.Verify(
+            p => p.SendAsync(
+                It.IsAny<HttpRequestMessage>(),
+                It.IsAny<HttpCompletionOption>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
 }
