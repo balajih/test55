@@ -1,121 +1,99 @@
-using Microsoft.Graph;
-using Microsoft.Kiota.Abstractions;
-using Moq;
-using Newtonsoft.Json;
-using System.Net;
-using System.Net.Http;
+import { CanDeactivateFn } from '@angular/router';
 
-[TestClass]
-public class UserBatchRequestTests
+export interface HasUnsavedChanges {
+  hasUnsavedChanges(): boolean;
+}
+
+export const unsavedChangesGuard: CanDeactivateFn<HasUnsavedChanges> = (component) => {
+  if (component.hasUnsavedChanges()) {
+    return confirm('You have unsaved changes. Do you really want to leave?');
+  }
+  return true;
+};
+
+
+import { Component, HostListener, OnDestroy, OnInit } from '@angular/core';
+import { FormBuilder, FormGroup, ReactiveFormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
+import { HasUnsavedChanges } from './unsaved-changes.guard';
+
+@Component({
+  selector: 'app-my-form',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  template: `
+    <form [formGroup]="form">
+      <!-- your form fields -->
+    </form>
+  `,
+})
+export class MyFormComponent implements HasUnsavedChanges, OnInit, OnDestroy {
+  form: FormGroup;
+  private skipGuard = false;
+  private navigatingBack = false;
+  private restoringBarrier = false;
+  private boundPopState = this.handlePopState.bind(this);
+
+  constructor(private fb: FormBuilder, private router: Router) {
+    this.form = this.fb.group({
+      // your fields
+    });
+  }
+
+  ngOnInit(): void {
+    history.pushState(null, '', location.href);
+    window.addEventListener('popstate', this.boundPopState);
+  }
+
+  ngOnDestroy(): void {
+    window.removeEventListener('popstate', this.boundPopState);
+  }
+
+  hasUnsavedChanges(): boolean {
+    return !this.skipGuard && this.form.dirty;
+  }
+
+  @HostListener('window:beforeunload', ['$event'])
+  onBeforeUnload(event: BeforeUnloadEvent): void {
+    if (this.form.dirty) {
+      event.preventDefault();
+    }
+  }
+
+  onSave(): void {
+    // ... save logic
+    this.form.markAsPristine();
+    // OR for programmatic navigation:
+    this.skipGuard = true;
+    this.router.navigate(['/success']);
+  }
+
+  private handlePopState(): void {
+    if (this.navigatingBack || this.restoringBarrier) {
+      this.restoringBarrier = false;
+      return;
+    }
+
+    if (this.form.dirty) {
+      const confirmed = confirm('You have unsaved changes. Do you really want to leave?');
+      if (confirmed) {
+        this.navigatingBack = true;
+        this.skipGuard = true;
+        history.back();
+      } else {
+        this.restoringBarrier = true;
+        history.forward();
+      }
+    } else {
+      this.navigatingBack = true;
+      history.back();
+    }
+  }
+}
+
+
 {
-    private Mock<IHttpProvider> _mockHttpProvider;
-    private GraphServiceClient _graphClient;
-
-    [TestInitialize]
-    public void Setup()
-    {
-        _mockHttpProvider = new Mock<IHttpProvider>();
-        
-        // Build a fake batch response with one user result per step
-        var batchResponse = new
-        {
-            responses = new[]
-            {
-                new
-                {
-                    id = "step_1",
-                    status = 200,
-                    body = new
-                    {
-                        value = new[]
-                        {
-                            new
-                            {
-                                givenName  = "John",
-                                surname    = "Doe",
-                                displayName = "John Doe",
-                                mail       = "john.doe@example.com",
-                                id         = "user-id-001"
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        var responseJson    = JsonConvert.SerializeObject(batchResponse);
-        var httpResponse    = new HttpResponseMessage(HttpStatusCode.OK)
-        {
-            Content = new StringContent(responseJson,
-                          System.Text.Encoding.UTF8,
-                          "application/json")
-        };
-
-        // IHttpProvider.SendAsync returns the mocked HTTP response
-        _mockHttpProvider
-            .Setup(p => p.SendAsync(
-                It.IsAny<HttpRequestMessage>(),
-                It.IsAny<HttpCompletionOption>(),
-                It.IsAny<CancellationToken>()))
-            .ReturnsAsync(httpResponse);
-
-        // Wire the mock provider into GraphServiceClient
-        var mockAuthProvider = new Mock<IAuthenticationProvider>();
-        _graphClient = new GraphServiceClient(mockAuthProvider.Object,
-                                              _mockHttpProvider.Object);
-    }
-
-    [TestMethod]
-    public async Task FetchUsersByMail_ReturnsMappedUsers()
-    {
-        // Arrange
-        var fallbackIds = new List<string> { "john.doe@example.com" };
-        var mailBatch   = new BatchRequestContent();
-        var mailStepMap = new Dictionary<string, string>();
-
-        foreach (var id in fallbackIds)
-        {
-            var stepId = mailBatch.AddBatchRequestStep(
-                _graphClient.Users
-                    .Request()
-                    .Filter($"mail eq '{id}'")
-                    .Top(1)
-                    .Select(x => new { x.GivenName, x.Surname,
-                                       x.DisplayName, x.Mail, x.Id })
-                    .GetHttpRequestMessage());
-
-            mailStepMap[stepId] = id;
-        }
-
-        // Act
-        var batchResponse = await _graphClient
-                                    .Batch
-                                    .Request()
-                                    .PostAsync(mailBatch);
-
-        // Assert — each step resolves to the expected user
-        foreach (var (stepId, mail) in mailStepMap)
-        {
-            var usersPage = await batchResponse
-                                    .GetResponseByIdAsync<GraphServiceUsersCollectionResponse>(stepId);
-
-            Assert.IsNotNull(usersPage?.Value,
-                $"No user returned for mail '{mail}'");
-
-            var user = usersPage.Value.First();
-            Assert.AreEqual("john.doe@example.com", user.Mail);
-            Assert.AreEqual("John",  user.GivenName);
-            Assert.AreEqual("Doe",   user.Surname);
-            Assert.AreEqual("John Doe", user.DisplayName);
-            Assert.AreEqual("user-id-001", user.Id);
-        }
-
-        // Verify the HTTP provider was actually called once (the batch POST)
-        _mockHttpProvider.Verify(
-            p => p.SendAsync(
-                It.IsAny<HttpRequestMessage>(),
-                It.IsAny<HttpCompletionOption>(),
-                It.IsAny<CancellationToken>()),
-            Times.Once);
-    }
+  path: 'my-form',
+  loadComponent: () => import('./my-form.component').then(m => m.MyFormComponent),
+  canDeactivate: [unsavedChangesGuard],
 }
