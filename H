@@ -1,17 +1,3 @@
-import { CanDeactivateFn } from '@angular/router';
-
-export interface HasUnsavedChanges {
-  hasUnsavedChanges(): boolean;
-}
-
-export const unsavedChangesGuard: CanDeactivateFn<HasUnsavedChanges> = (component) => {
-  if (component.hasUnsavedChanges()) {
-    return confirm('You have unsaved changes. Do you really want to leave?');
-  }
-  return true;
-};
-
-
 import { Component, HostListener, OnDestroy, OnInit } from '@angular/core';
 import { FormBuilder, FormGroup, ReactiveFormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
@@ -31,7 +17,7 @@ export class MyFormComponent implements HasUnsavedChanges, OnInit, OnDestroy {
   form: FormGroup;
   private skipGuard = false;
   private navigatingBack = false;
-  private restoringBarrier = false;
+  private restoringPosition = false;
   private boundPopState = this.handlePopState.bind(this);
 
   constructor(private fb: FormBuilder, private router: Router) {
@@ -41,12 +27,11 @@ export class MyFormComponent implements HasUnsavedChanges, OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    history.pushState(null, '', location.href);
-    window.addEventListener('popstate', this.boundPopState);
+    window.addEventListener('popstate', this.boundPopState, true); // capture phase
   }
 
   ngOnDestroy(): void {
-    window.removeEventListener('popstate', this.boundPopState);
+    window.removeEventListener('popstate', this.boundPopState, true);
   }
 
   hasUnsavedChanges(): boolean {
@@ -68,32 +53,31 @@ export class MyFormComponent implements HasUnsavedChanges, OnInit, OnDestroy {
     this.router.navigate(['/success']);
   }
 
-  private handlePopState(): void {
-    if (this.navigatingBack || this.restoringBarrier) {
-      this.restoringBarrier = false;
+  private handlePopState(event: PopStateEvent): void {
+    // Let the confirmed back-navigation reach Angular
+    if (this.navigatingBack) return;
+
+    // Suppress the restore-popstate so Angular doesn't see it
+    if (this.restoringPosition) {
+      event.stopImmediatePropagation();
+      this.restoringPosition = false;
       return;
     }
 
-    if (this.form.dirty) {
-      const confirmed = confirm('You have unsaved changes. Do you really want to leave?');
-      if (confirmed) {
-        this.navigatingBack = true;
-        this.skipGuard = true;
-        history.back();
-      } else {
-        this.restoringBarrier = true;
-        history.forward();
-      }
-    } else {
+    // Clean form — let Angular handle normally
+    if (!this.form.dirty) return;
+
+    // Dirty form — intercept before Angular sees it
+    event.stopImmediatePropagation();
+
+    const confirmed = confirm('You have unsaved changes. Do you really want to leave?');
+    if (confirmed) {
       this.navigatingBack = true;
-      history.back();
+      this.skipGuard = true;
+      history.back(); // next popstate reaches Angular (navigatingBack skips our handler)
+    } else {
+      this.restoringPosition = true;
+      history.go(1); // move pointer forward to form — no entries added
     }
   }
-}
-
-
-{
-  path: 'my-form',
-  loadComponent: () => import('./my-form.component').then(m => m.MyFormComponent),
-  canDeactivate: [unsavedChangesGuard],
 }
