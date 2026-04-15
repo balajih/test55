@@ -1,0 +1,93 @@
+import { CanDeactivateFn } from '@angular/router';
+
+export interface HasUnsavedChanges {
+  hasUnsavedChanges(): boolean;
+  confirmNavigation(): void;
+}
+
+export const unsavedChangesGuard: CanDeactivateFn<HasUnsavedChanges> = (component) => {
+  if (component.hasUnsavedChanges()) {
+    const confirmed = confirm('You have unsaved changes. Do you really want to leave?');
+    if (confirmed) {
+      component.confirmNavigation(); // suppress beforeunload
+    }
+    return confirmed;
+  }
+  return true;
+};
+
+
+
+
+// app.config.ts
+provideRouter(
+  routes,
+  withRouterConfig({ canceledNavigationResolution: 'computed' })
+)
+
+
+
+
+
+
+
+
+
+
+
+import { Component, HostListener } from '@angular/core';
+import { FormBuilder, FormGroup, ReactiveFormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
+import { HasUnsavedChanges } from './unsaved-changes.guard';
+
+@Component({
+  selector: 'app-my-form',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  template: `
+    <form [formGroup]="form">
+      <!-- your form fields -->
+    </form>
+  `,
+})
+export class MyFormComponent implements HasUnsavedChanges {
+  form: FormGroup;
+  private confirmedViaGuard = false;
+
+  constructor(private fb: FormBuilder, private router: Router) {
+    this.form = this.fb.group({
+      // your fields
+    });
+  }
+
+  hasUnsavedChanges(): boolean {
+    return this.form.dirty;
+  }
+
+  confirmNavigation(): void {
+    this.confirmedViaGuard = true;
+  }
+
+  @HostListener('window:beforeunload', ['$event'])
+  onBeforeUnload(event: BeforeUnloadEvent): void {
+    if (this.form.dirty && !this.confirmedViaGuard) {
+      event.preventDefault();
+    }
+  }
+
+  onSave(): void {
+    // ... save logic
+    this.form.markAsPristine();
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
