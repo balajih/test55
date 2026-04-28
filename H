@@ -1,83 +1,85 @@
-import { Component, HostListener, OnDestroy, OnInit } from '@angular/core';
-import { FormBuilder, FormGroup, ReactiveFormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
-import { HasUnsavedChanges } from './unsaved-changes.guard';
+import { TestBed } from '@angular/core/testing';
+import { ActivatedRouteSnapshot, RouterStateSnapshot } from '@angular/router';
+import { unsavedChangesGuard, HasUnsavedChanges } from './unsaved-changes.guard';
 
-@Component({
-  selector: 'app-my-form',
-  standalone: true,
-  imports: [ReactiveFormsModule],
-  template: `
-    <form [formGroup]="form">
-      <!-- your form fields -->
-    </form>
-  `,
-})
-export class MyFormComponent implements HasUnsavedChanges, OnInit, OnDestroy {
-  form: FormGroup;
-  private skipGuard = false;
-  private navigatingBack = false;
-  private restoringPosition = false;
-  private boundPopState = this.handlePopState.bind(this);
+describe('unsavedChangesGuard', () => {
+  let mockComponent: jasmine.SpyObj<HasUnsavedChanges>;
 
-  constructor(private fb: FormBuilder, private router: Router) {
-    this.form = this.fb.group({
-      // your fields
+  const runGuard = (component: any): boolean =>
+    TestBed.runInInjectionContext(() =>
+      unsavedChangesGuard(
+        component,
+        {} as ActivatedRouteSnapshot,
+        {} as RouterStateSnapshot,
+        {} as RouterStateSnapshot
+      )
+    ) as boolean;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({});
+    mockComponent = jasmine.createSpyObj<HasUnsavedChanges>('HasUnsavedChanges', [
+      'hasUnsavedChanges',
+      'confirmNavigation'
+    ]);
+  });
+
+  describe('when component is null', () => {
+    it('should return true and allow navigation', () => {
+      expect(runGuard(null)).toBeTrue();
     });
-  }
+  });
 
-  ngOnInit(): void {
-    window.addEventListener('popstate', this.boundPopState, true); // capture phase
-  }
+  describe('when form is not dirty', () => {
+    it('should return true and allow navigation without showing dialog', () => {
+      spyOn(window, 'confirm');
+      mockComponent.hasUnsavedChanges.and.returnValue(false);
 
-  ngOnDestroy(): void {
-    window.removeEventListener('popstate', this.boundPopState, true);
-  }
+      expect(runGuard(mockComponent)).toBeTrue();
+      expect(window.confirm).not.toHaveBeenCalled();
+    });
+  });
 
-  hasUnsavedChanges(): boolean {
-    return !this.skipGuard && this.form.dirty;
-  }
+  describe('when form is dirty', () => {
+    beforeEach(() => {
+      mockComponent.hasUnsavedChanges.and.returnValue(true);
+    });
 
-  @HostListener('window:beforeunload', ['$event'])
-  onBeforeUnload(event: BeforeUnloadEvent): void {
-    if (this.form.dirty) {
-      event.preventDefault();
-    }
-  }
+    it('should show confirm dialog with correct message', () => {
+      spyOn(window, 'confirm').and.returnValue(true);
 
-  onSave(): void {
-    // ... save logic
-    this.form.markAsPristine();
-    // OR for programmatic navigation:
-    this.skipGuard = true;
-    this.router.navigate(['/success']);
-  }
+      runGuard(mockComponent);
 
-  private handlePopState(event: PopStateEvent): void {
-    // Let the confirmed back-navigation reach Angular
-    if (this.navigatingBack) return;
+      expect(window.confirm).toHaveBeenCalledOnceWith(
+        'You have unsaved changes. Do you really want to leave?'
+      );
+    });
 
-    // Suppress the restore-popstate so Angular doesn't see it
-    if (this.restoringPosition) {
-      event.stopImmediatePropagation();
-      this.restoringPosition = false;
-      return;
-    }
+    describe('and user confirms', () => {
+      beforeEach(() => spyOn(window, 'confirm').and.returnValue(true));
 
-    // Clean form — let Angular handle normally
-    if (!this.form.dirty) return;
+      it('should return true and allow navigation', () => {
+        expect(runGuard(mockComponent)).toBeTrue();
+      });
 
-    // Dirty form — intercept before Angular sees it
-    event.stopImmediatePropagation();
+      it('should call confirmNavigation', () => {
+        runGuard(mockComponent);
 
-    const confirmed = confirm('You have unsaved changes. Do you really want to leave?');
-    if (confirmed) {
-      this.navigatingBack = true;
-      this.skipGuard = true;
-      history.back(); // next popstate reaches Angular (navigatingBack skips our handler)
-    } else {
-      this.restoringPosition = true;
-      history.go(1); // move pointer forward to form — no entries added
-    }
-  }
-}
+        expect(mockComponent.confirmNavigation).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('and user cancels', () => {
+      beforeEach(() => spyOn(window, 'confirm').and.returnValue(false));
+
+      it('should return false and block navigation', () => {
+        expect(runGuard(mockComponent)).toBeFalse();
+      });
+
+      it('should not call confirmNavigation', () => {
+        runGuard(mockComponent);
+
+        expect(mockComponent.confirmNavigation).not.toHaveBeenCalled();
+      });
+    });
+  });
+});
